@@ -20,6 +20,8 @@ from torch.autograd import Variable
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.ticker import NullLocator
+import cv2
+import numpy as np
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -43,12 +45,12 @@ if __name__ == "__main__":
                         help="size of each image dimension")
     parser.add_argument("--checkpoint_model", type=str,
                         help="path to checkpoint model")
+    parser.add_argument("--rtsp_url", type=str,
+                        default="rtsp://192.168.67.116/live0.264", help="RTSP URL of a camera")
     opt = parser.parse_args()
     print(opt)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    os.makedirs("output", exist_ok=True)
 
     # Set up model
     model = Darknet(opt.model_def, img_size=opt.img_size).to(device)
@@ -61,98 +63,66 @@ if __name__ == "__main__":
         model.load_state_dict(torch.load(opt.weights_path))
 
     model.eval()  # Set in evaluation mode
-
-    dataloader = DataLoader(
-        ImageFolder(opt.image_folder, img_size=opt.img_size),
-        batch_size=opt.batch_size,
-        shuffle=False,
-        num_workers=opt.n_cpu,
-    )
+    cv2.namedWindow("detection", cv2.WINDOW_AUTOSIZE)
+    # dataloader = DataLoader(
+    #     ImageFolder(opt.image_folder, img_size=opt.img_size),
+    #     batch_size=opt.batch_size,
+    #     shuffle=False,
+    #     num_workers=opt.n_cpu,
+    # )
+    camera = cv2.VideoCapture(opt.rtsp_url)
 
     classes = load_classes(opt.class_path)  # Extracts class labels from file
 
     Tensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
 
-    imgs = []  # Stores image paths
-    img_detections = []  # Stores detections for each image index
-
     print("\nPerforming object detection:")
     prev_time = time.time()
-    print(dataloader)
-    for batch_i, (img_paths, input_imgs) in enumerate(dataloader):
+    # Bounding-box colors
+    # cmap = plt.get_cmap("tab20b")
+    # colors = [cmap(i) for i in np.linspace(0, 1, 20)]
+    index = 0
+    # plt.figure()
+    # fig, ax = plt.subplots(1)
+    while True:
         # Configure input
-        input_imgs = Variable(input_imgs.type(Tensor))
-        print(input_imgs.size())
+        res, frame = camera.read()
+
+        if not res:
+            break
+        img_resized = cv2.resize(frame, (opt.img_size, opt.img_size))
+
+        img = torch.from_numpy(img_resized.transpose(
+            2, 0, 1)).float().div(255).unsqueeze(0).to(device)
+        # print(img_tensor.size())
         # Get detections
         with torch.no_grad():
-            detections = model(input_imgs)
-            detections = non_max_suppression(
-                detections, opt.conf_thres, opt.nms_thres)
+            detections = model(img)
+            detections = non_max_suppression(detections, opt.conf_thres, opt.nms_thres)
 
         # Log progress
         current_time = time.time()
         inference_time = datetime.timedelta(seconds=current_time - prev_time)
         prev_time = current_time
-        print("\t+ Batch %d, Inference Time: %s" % (batch_i, inference_time))
-
-        # Save image and detections
-        imgs.extend(img_paths)
-        img_detections.extend(detections)
-
-    # Bounding-box colors
-    cmap = plt.get_cmap("tab20b")
-    colors = [cmap(i) for i in np.linspace(0, 1, 20)]
-
-    print("\nSaving images:")
-    # Iterate through images and save plot of detections
-    for img_i, (path, detections) in enumerate(zip(imgs, img_detections)):
-
-        print("(%d) Image: '%s'" % (img_i, path))
-
-        # Create plot
-        img = np.array(Image.open(path))
-        plt.figure()
-        fig, ax = plt.subplots(1)
-        ax.imshow(img)
+        print("\t+ Index %d, Inference Time: %s" % (index, inference_time))
 
         # Draw bounding boxes and labels of detections
-        if detections is not None:
+        detection = detections[0]
+        if detection is not None:
+            # print(detection)
             # Rescale boxes to original image
-            detections = rescale_boxes(detections, opt.img_size, img.shape[:2])
-            unique_labels = detections[:, -1].cpu().unique()
-            n_cls_preds = len(unique_labels)
-            bbox_colors = random.sample(colors, n_cls_preds)
-            for x1, y1, x2, y2, conf, cls_conf, cls_pred in detections:
-
-                print("\t+ Label: %s, Conf: %.5f" %
-                      (classes[int(cls_pred)], cls_conf.item()))
+            print(img_resized.shape[:2])
+            detection = rescale_boxes(
+                detection, opt.img_size, img_resized.shape[:2])
+            for x1, y1, x2, y2, conf, cls_conf, cls_pred in detection:
+                # if cls_conf.item() <= 0.7:
+                #     continue
+                print("\t+ Label: %s, Conf: %.5f" % (classes[int(cls_pred)], cls_conf.item()))
                 print(x1.item(), y1.item(), x2.item(), y2.item())
+                cv2.rectangle(img_resized, (int(x1.item()), int(y1.item())), (int(x2.item()), int(y2.item())), (0, 255, 0), 3)
+        cv2.imshow("detection", img_resized)
+        index += 1
+        if cv2.waitKey(40) & 0xff == 27:
+            break
 
-                box_w = x2 - x1
-                box_h = y2 - y1
-
-                color = bbox_colors[int(
-                    np.where(unique_labels == int(cls_pred))[0])]
-                # Create a Rectangle patch
-                bbox = patches.Rectangle(
-                    (x1, y1), box_w, box_h, linewidth=2, edgecolor=color, facecolor="none")
-                # Add the bbox to the plot
-                ax.add_patch(bbox)
-                # Add label
-                plt.text(
-                    x1,
-                    y1,
-                    s=classes[int(cls_pred)],
-                    color="white",
-                    verticalalignment="top",
-                    bbox={"color": color, "pad": 0},
-                )
-
-        # Save generated image with detections
-        plt.axis("off")
-        plt.gca().xaxis.set_major_locator(NullLocator())
-        plt.gca().yaxis.set_major_locator(NullLocator())
-        filename = path.split("/")[-1].split(".")[0]
-        plt.savefig(f"output/{filename}.png",
-                    bbox_inches="tight", pad_inches=0.0)
-        plt.close()
+    camera.release()
